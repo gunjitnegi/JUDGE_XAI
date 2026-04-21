@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Data (Too large for GitHub)
+data/
+data/raw/
+data/processed/
+data/faiss_index/
+data/reports/
+data/temp_uploads/
+
+# Logs
+*.log
+src/preprocessing/logs/
+
+# IDEs
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/
+
+# Temporary and Scratch files
+llm_venv/
+test_pdf/
+processed_chunks_test.json
+project_overview.txt
+scratch_peek.py
+suamrization_task.txt
