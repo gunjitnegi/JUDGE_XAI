@@ -101,4 +101,4 @@ Contributions are welcome! If you find a bug or have a feature request, please o
 Distributed under the MIT License. See `LICENSE` for more information.
 
 ---
-**Created with ❤️ for the Indian Legal Community.**
+
