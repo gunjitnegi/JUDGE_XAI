@@ -55,13 +55,14 @@ class Retriever:
             "overlap_ratio": round(len(matching) / total_query, 2)
         }
 
-    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def retrieve(self, query: str, top_k: int = 5, case_id: str = None) -> List[Dict[str, Any]]:
         """
         Retrieve the top-K most relevant chunks for a query.
 
         Args:
             query: The user's question or search query.
             top_k: Number of results to return.
+            case_id: Optional case ID to restrict the search space.
 
         Returns:
             List of result dicts with XAI-enriched fields:
@@ -72,8 +73,9 @@ class Retriever:
         # Embed the query
         query_embedding = self.embedding_manager.embed_single(query)
 
-        # Search FAISS
-        results = self.vector_store.search(query_embedding, top_k=top_k)
+        # Search ChromaDB
+        where = {"case_id": case_id} if case_id else None
+        results = self.vector_store.search(query_embedding, top_k=top_k, where=where)
 
         # Enrich each result with keyword overlap analysis (XAI Goal #2)
         for result in results:

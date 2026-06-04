@@ -101,6 +101,53 @@ def validate_case(
     return len(reasons) == 0, reasons
 
 
+import re
+
+# Simple heuristic for OCR garbage: too many non-word characters or repeating patterns
+OCR_GARBAGE_PATTERN = re.compile(r'([^a-zA-Z0-9\s])\1{4,}')
+
+def clean_paragraphs(record: Dict[str, Any], config: Dict[str, Any]) -> None:
+    """
+    Mutates record in-place to remove empty, extremely short, repeated, or OCR garbage paragraphs.
+    Must be called BEFORE validate_case so that validation counts are accurate.
+    """
+    paragraphs = record.get("paragraphs", [])
+    if not isinstance(paragraphs, list):
+        return
+
+    cleaned = []
+    seen_texts = set()
+
+    for p in paragraphs:
+        text = p.get("text", "").strip()
+        
+        # Drop empty
+        if not text:
+            continue
+            
+        # Drop extremely short lines that aren't meaningful headings (less than 10 chars usually isn't useful in law except very specific things, but we'll use a safe bound of 15 if not a known structure)
+        if len(text) < 15 and not any(k in text.lower() for k in ["court", "judge", "v.", "vs", "order"]):
+            continue
+            
+        # Drop repeated lines exactly
+        if text in seen_texts:
+            continue
+            
+        # Drop OCR garbage
+        if OCR_GARBAGE_PATTERN.search(text):
+            continue
+            
+        # Drop if it's over 50% non-ascii/punctuation
+        alpha_num_count = sum(c.isalnum() for c in text)
+        if alpha_num_count / max(1, len(text)) < 0.3:
+            continue
+
+        seen_texts.add(text)
+        cleaned.append(p)
+
+    record["paragraphs"] = cleaned
+
+
 def truncate_paragraphs(record: Dict[str, Any], config: Dict[str, Any]) -> None:
     """
     Mutates record in-place — ONLY call this on cases that already passed validation
@@ -166,6 +213,7 @@ def main() -> None:
                 removal_stats["json_decode_error"] += 1
                 continue
 
+            clean_paragraphs(record, CONFIG)
             is_valid, reasons = validate_case(record, CONFIG)
 
             if is_valid:

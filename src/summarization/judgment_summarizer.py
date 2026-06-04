@@ -85,7 +85,18 @@ class JudgmentSummarizer:
             if len(words) > 2500:
                 content = " ".join(words[:2500]) + "..."
             
-            prompt = f"Section: {section}\n\nContent:\n{content}\n\nTask: {prompts[section]}"
+            prompt = f"""You are a legal summarization AI for the general public.
+CRITICAL INSTRUCTIONS:
+- Use simple, everyday layman's English. Your summary must be easily understood by the general public.
+- Translate complex legal logic into simple, understandable concepts.
+- Do NOT use dense legal jargon (e.g., "impugned", "inter alia", "appellant", "respondent"). Translate these into normal words (e.g., "challenged", "among other things", "the person appealing", "the defending party").
+
+Section: {section}
+
+Content:
+{content}
+
+Task: {prompts[section]}"""
             summary["sections"][section] = self._call_llm(prompt)
 
         return summary

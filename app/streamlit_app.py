@@ -8,9 +8,14 @@ import sys
 import time
 import json
 import streamlit as st
+import re
+import hashlib
+from html import escape as h_escape
+from pathlib import Path
+from pathlib import Path
 
 # Ensure project root is on path
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, PROJECT_ROOT)
 
 from src.rag.rag_pipeline import RAGPipeline
@@ -61,8 +66,11 @@ section[data-testid="stSidebar"] h3 {
     color: #f1f5f9 !important;
 }
 
-/* ── Hide Streamlit branding ── */
-#MainMenu, footer, header {visibility: hidden !important;}
+/* ── Hide Streamlit branding but keep sidebar toggle ── */
+#MainMenu, footer {visibility: hidden !important;}
+header[data-testid="stHeader"] {
+    background-color: transparent !important;
+}
 
 /* ── Main container ── */
 .main .block-container {
@@ -394,8 +402,69 @@ hr { border-color: #1e293b !important; }
 
 /* ── JSON viewer dark ── */
 .stJson { background: #111827 !important; }
+
+/* -- Highlighting for Jump-to-Context -- */
+.highlight-para {
+    background: rgba(99, 102, 241, 0.2) !important;
+    border-left: 4px solid #6366f1 !important;
+    padding: 10px !important;
+    border-radius: 4px !important;
+}
 </style>
 """, unsafe_allow_html=True)
+
+# ──────────────────────────────────────────────
+# XAI Helpers
+# ──────────────────────────────────────────────
+ROLE_CONFIG = {
+    "FACTS":      {"color": "#60a5fa", "bg": "rgba(59,130,246,.2)",  "bdr": "rgba(59,130,246,.5)",  "icon": "📋"},
+    "ARGUMENTS":  {"color": "#fbbf24", "bg": "rgba(245,158,11,.2)",  "bdr": "rgba(245,158,11,.5)",  "icon": "⚖️"},
+    "REASONING":  {"color": "#34d399", "bg": "rgba(16,185,129,.2)",  "bdr": "rgba(16,185,129,.5)",  "icon": "🧠"},
+    "DECISION":   {"color": "#f472b6", "bg": "rgba(236,72,153,.2)",  "bdr": "rgba(236,72,153,.5)",  "icon": "🔨"},
+    "ISSUE":      {"color": "#fb923c", "bg": "rgba(249,115,22,.2)",  "bdr": "rgba(249,115,22,.5)",  "icon": "❓"},
+    "HEADNOTES":  {"color": "#c084fc", "bg": "rgba(192,132,252,.2)", "bdr": "rgba(192,132,252,.5)", "icon": "📌"},
+    "PREAMBLE":   {"color": "#94a3b8", "bg": "rgba(148,163,184,.15)","bdr": "rgba(148,163,184,.4)", "icon": "📄"},
+    "STATUTE":    {"color": "#f87171", "bg": "rgba(239,68,68,.15)",  "bdr": "rgba(239,68,68,.4)",   "icon": "📜"},
+}
+_ROLE_DEF = {"color": "#94a3b8", "bg": "rgba(148,163,184,.1)", "bdr": "rgba(148,163,184,.25)", "icon": "📄"}
+
+def _rcfg(section: str) -> dict:
+    return ROLE_CONFIG.get(section.upper().strip(), _ROLE_DEF)
+
+def role_badge(section: str) -> str:
+    """Inline HTML badge coloured by rhetorical role."""
+    c = _rcfg(section)
+    return (f'<span style="display:inline-block;background:{c["bg"]};color:{c["color"]};'
+            f'border:1px solid {c["bdr"]};border-radius:6px;padding:.15rem .55rem;'
+            f'font-size:.78rem;font-weight:700;">{c["icon"]} {section.upper()}</span>')
+
+def highlight_keywords(text: str, keywords: list) -> str:
+    """
+    HTML-escape raw chunk text and wrap every matched keyword in a purple
+    highlight <mark>. Safe for st.markdown(unsafe_allow_html=True).
+    Longest keywords processed first to prevent partial-word clobbering.
+    """
+    safe = h_escape(text)
+    if not keywords:
+        return safe
+    for kw in sorted(set(keywords), key=len, reverse=True):
+        if len(kw) < 3:
+            continue
+        pattern = re.compile(r'(?<!\w)' + re.escape(h_escape(kw)) + r'(?!\w)', re.IGNORECASE)
+        safe = pattern.sub(
+            lambda m: (f'<mark style="background:rgba(99,102,241,.32);color:#c7d2fe;'
+                       f'border-radius:3px;padding:1px 4px;font-weight:600;">{m.group()}</mark>'),
+            safe,
+        )
+    return safe
+
+def _sim_color(v: float) -> str:
+    return "#34d399" if v >= 70 else "#fbbf24" if v >= 50 else "#f87171"
+
+def _bar_gradient(v: float) -> str:
+    if v >= 70: return "linear-gradient(90deg,#10b981,#34d399)"
+    if v >= 50: return "linear-gradient(90deg,#f59e0b,#fbbf24)"
+    return "linear-gradient(90deg,#ef4444,#f87171)"
 
 # ──────────────────────────────────────────────
 # Session state init
@@ -406,13 +475,18 @@ if "pipeline" not in st.session_state:
     st.session_state.chunks_count = 0
     st.session_state.history = []
     st.session_state.pdf_name = None
+    st.session_state.active_para = None
+    st.session_state.current_result = None
+    st.session_state.faith_cache = {}
 
 pipeline: RAGPipeline = st.session_state.pipeline
 
 # ──────────────────────────────────────────────
 # Sidebar
 # ──────────────────────────────────────────────
-INDEX_DIR = r"c:\final_year\JUDGEXAI\data\faiss_index"
+from dotenv import load_dotenv
+load_dotenv()
+INDEX_DIR = os.getenv("INDEX_DIR", str(Path(PROJECT_ROOT) / "data" / "faiss_index"))
 
 with st.sidebar:
     st.markdown("## ⚖️ JUDGE X AI")
@@ -462,8 +536,8 @@ with st.sidebar:
                     progress.progress(90, text="Saving FAISS index...")
 
                     st.session_state.index_loaded = True
-                    st.session_state.chunks_count = pipeline.vector_store.index.ntotal
                     st.session_state.pdf_name = uploaded_file.name
+                    st.session_state.chunks_count = len(pipeline.vector_store.get_all_chunks(case_id=uploaded_file.name))
                     progress.progress(100, text="Done!")
                     st.success(f"✅ Indexed **{num_chunks}** chunks")
                     time.sleep(1)
@@ -474,20 +548,41 @@ with st.sidebar:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
 
-    # Load existing index button (instead of auto-load)
-    if not st.session_state.index_loaded and os.path.exists(os.path.join(INDEX_DIR, "legal_index.faiss")):
-        st.markdown("---")
-        st.caption("A previously saved index was found.")
-        if st.button("📂 Load Existing Index", use_container_width=True, key="load_idx_btn"):
-            try:
-                pipeline.load_index(INDEX_DIR)
-                st.session_state.index_loaded = True
-                st.session_state.chunks_count = pipeline.vector_store.index.ntotal
-                # Read the actual source PDF name from saved metadata
-                st.session_state.pdf_name = pipeline.vector_store.source_file or "Unknown document"
-                st.rerun()
-            except Exception as e:
-                st.error(f"Failed to load: {e}")
+    # Document Library / Chat History
+    st.markdown("### 📚 Document Library")
+    try:
+        # Passively initialize vector store if needed
+        if not pipeline.vector_store:
+            pipeline.load_index(INDEX_DIR)
+            
+        all_cases = pipeline.vector_store.get_all_cases()
+        if all_cases:
+            # Determine current index
+            current_index = 0
+            if st.session_state.pdf_name and st.session_state.pdf_name in all_cases:
+                current_index = all_cases.index(st.session_state.pdf_name) + 1
+                
+            selected_case = st.selectbox(
+                "Select a previous judgment to query:",
+                ["-- Select Document --"] + all_cases,
+                index=current_index,
+                key="doc_library_select"
+            )
+            
+            if selected_case != "-- Select Document --" and selected_case != st.session_state.pdf_name:
+                # User switched active document!
+                with st.spinner(f"Loading {selected_case}..."):
+                    st.session_state.pdf_name = selected_case
+                    st.session_state.index_loaded = True
+                    pipeline.load_summary(selected_case)
+                    st.session_state.chunks_count = len(pipeline.vector_store.get_all_chunks(case_id=selected_case))
+                    # Clear query history for new doc
+                    st.session_state.history = []
+                    st.rerun()
+        else:
+            st.caption("No previously indexed documents found.")
+    except Exception as e:
+        st.caption(f"Could not load document library.")
 
     st.markdown("---")
 
@@ -550,6 +645,7 @@ if st.session_state.index_loaded:
             # Statutes chips
             statutes = summary.get("statutes_cited", [])
             if statutes:
+                st.markdown("**Statutes Cited:**")
                 st.markdown('<div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px;">', unsafe_allow_html=True)
                 for s in statutes:
                     badge_class = "statute-badge badge-const" if "ART" in s.upper() else "statute-badge badge-ipc" if "IPC" in s.upper() else "statute-badge badge-bns"
@@ -573,7 +669,7 @@ if st.session_state.index_loaded:
             col_gen, _ = st.columns([1, 2])
             if col_gen.button("🪄 Generate Structured Summary", use_container_width=True):
                 with st.spinner("Analyzing judgment structure and generating summary..."):
-                    pipeline.generate_summary()
+                    pipeline.generate_summary(case_id=st.session_state.pdf_name)
                     st.rerun()
 
 st.markdown("")
@@ -599,9 +695,26 @@ if ask_clicked and query:
     if not st.session_state.index_loaded:
         st.warning("⚠️ Please upload and index a PDF first using the sidebar.")
     else:
-        with st.spinner("Thinking..."):
+        st.markdown("### 💡 Answer")
+        answer_placeholder = st.empty()
+        full_answer = ""
+        result = None
+        
+        with st.spinner("Retrieving evidence..."):
             try:
-                result = pipeline.query(query, top_k=top_k)
+                # pipeline.query is now a generator
+                generator = pipeline.query(query, top_k=top_k, case_id=st.session_state.pdf_name)
+                for chunk in generator:
+                    if isinstance(chunk, dict):
+                        # Final response dictionary
+                        result = chunk
+                    else:
+                        full_answer += chunk
+                        answer_placeholder.markdown(f'<div class="answer-card"><p>{full_answer}▌</p></div>', unsafe_allow_html=True)
+                
+                # Final render without cursor
+                answer_placeholder.markdown(f'<div class="answer-card"><p>{full_answer}</p></div>', unsafe_allow_html=True)
+                st.session_state.current_result = result
             except Exception as e:
                 st.error(f"❌ Pipeline error: {e}")
                 st.stop()
@@ -609,97 +722,181 @@ if ask_clicked and query:
         # Save to history
         st.session_state.history.append({"question": query, "result": result})
 
-        # ── Answer ──
-        st.markdown("### 💡 Answer")
+result = st.session_state.get("current_result")
+if result:
+
+    # --- XAI SNAPSHOT BANNER ---
+    qh = hashlib.md5(result["query_info"]["original_query"].encode()).hexdigest()
+    
+    sims = [r["similarity_pct"] for r in result["retrieved_chunks"]]
+    best_sim = max(sims) if sims else 0
+    
+    # --- Fix E: Confidence Warnings ---
+    if best_sim < 30.0:
+        st.warning("⚠️ **Low Confidence:** The retrieved context may not fully answer this question. The model may be guessing.")
+
+    avg_sim = sum(sims)/len(sims) if sims else 0
+    
+    all_kws = set()
+    matched_kws = set()
+    if result["retrieved_chunks"]:
+        first_kw = result["retrieved_chunks"][0].get("keyword_overlap", {})
+        all_kws = set(first_kw.get("query_keywords", []))
+    for r in result["retrieved_chunks"]:
+        matched_kws.update(r.get("keyword_overlap", {}).get("matching_keywords", []))
+        
+    kw_cov = (len(matched_kws) / len(all_kws) * 100) if all_kws else 0
+    
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(f'<div class="stat-card" style="border-top:3px solid {_sim_color(best_sim)}"><div class="stat-value" style="color:{_sim_color(best_sim)}!important">{best_sim:.1f}%</div><div class="stat-label">Best Match</div></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown(f'<div class="stat-card"><div class="stat-value">{avg_sim:.1f}%</div><div class="stat-label">Avg Sim</div></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="stat-card"><div class="stat-value">{kw_cov:.0f}%</div><div class="stat-label">KW Coverage</div></div>', unsafe_allow_html=True)
+    with c4:
+        if qh in st.session_state.faith_cache:
+            f_score = st.session_state.faith_cache[qh].get("faithfulness_score", 0) * 100
+            st.markdown(f'<div class="stat-card" style="border-top:3px solid {_sim_color(f_score)}"><div class="stat-value" style="color:{_sim_color(f_score)}!important">{f_score:.0f}%</div><div class="stat-label">Faithfulness</div></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="stat-card"><div class="stat-label" style="margin-bottom:10px;">Faithfulness (NLI)</div>', unsafe_allow_html=True)
+            if st.button("🧪 Run NLI Check", key="nli_btn", use_container_width=True):
+                from src.evaluation.faithfulness_eval import LegalFaithfulnessEvaluator
+                with st.spinner("Running Cross-Encoder NLI..."):
+                    # Only take top 3 chunks to save time
+                    evaluator = LegalFaithfulnessEvaluator()
+                    context_chunks = [r["chunk"]["text"] for r in result["retrieved_chunks"][:3]]
+                    
+                    faith_result = evaluator.evaluate_answer(result["answer"], context_chunks)
+                    st.session_state.faith_cache[qh] = faith_result
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+    # Role distribution
+    roles = [r["chunk"]["metadata"].get("section", "UNKNOWN").upper() for r in result["retrieved_chunks"]]
+    role_counts = {r: roles.count(r) for r in set(roles)}
+    role_html = " ".join([f"{role_badge(r)} ×{c}" for r, c in role_counts.items()])
+    st.markdown(f'<div style="margin-top:1rem; padding:.5rem 1rem; background:rgba(255,255,255,.02); border-radius:8px; border:1px solid rgba(255,255,255,.05);">{role_html}</div>', unsafe_allow_html=True)
+
+    # ── XAI Section ──
+    st.markdown("---")
+
+    # ── 1. Retrieval Trace ──
+    with st.expander("🔬 Why this answer? — Retrieval Trace", expanded=False):
         st.markdown(
-            f'<div class="answer-card"><p>{result["answer"]}</p></div>',
+            '<div class="xai-header">📍 Pipeline Trace</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("Every step the query went through before the answer was generated.")
+
+        for step in result["xai"]["retrieval_trace"]:
+            step_html = f'<div class="trace-step"><strong>Step {step["step"]}: {step["action"]}</strong><br>'
+            if "input" in step:
+                step_html += f'Input: <em>{step["input"]}</em><br>'
+                step_html += f'Output: <em>{step["output"][:250]}</em>'
+            if "detail" in step:
+                step_html += f'{step["detail"]}'
+            step_html += "</div>"
+            st.markdown(step_html, unsafe_allow_html=True)
+
+    # ── 2. Source Attribution ──
+    with st.expander("📚 Source Attribution — Retrieved Chunks", expanded=True):
+        st.markdown(
+            '<div class="xai-header">🎯 Ranked Sources</div>',
             unsafe_allow_html=True,
         )
 
-        # ── XAI Section ──
-        st.markdown("---")
+        for r in result["retrieved_chunks"]:
+            chunk = r["chunk"]
+            meta = chunk["metadata"]
+            sim = r["similarity_pct"]
+            kw = r.get("keyword_overlap", {})
+            matched_kws = kw.get("matching_keywords", [])
+            section = meta.get("section", "UNKNOWN")
+            role_c = _rcfg(section)["color"]
 
-        # ── 1. Retrieval Trace ──
-        with st.expander("🔬 Why this answer? — Retrieval Trace", expanded=False):
-            st.markdown(
-                '<div class="xai-header">📍 Pipeline Trace</div>',
-                unsafe_allow_html=True,
-            )
-            st.caption("Every step the query went through before the answer was generated.")
+            bar_color = _bar_gradient(sim)
+            score_color = _sim_color(sim)
 
-            for step in result["xai"]["retrieval_trace"]:
-                step_html = f'<div class="trace-step"><strong>Step {step["step"]}: {step["action"]}</strong><br>'
-                if "input" in step:
-                    step_html += f'Input: <em>{step["input"]}</em><br>'
-                    step_html += f'Output: <em>{step["output"][:250]}</em>'
-                if "detail" in step:
-                    step_html += f'{step["detail"]}'
-                step_html += "</div>"
-                st.markdown(step_html, unsafe_allow_html=True)
-
-        # ── 2. Source Attribution ──
-        with st.expander("📚 Source Attribution — Retrieved Chunks", expanded=True):
-            st.markdown(
-                '<div class="xai-header">🎯 Ranked Sources</div>',
-                unsafe_allow_html=True,
-            )
-
-            for r in result["retrieved_chunks"]:
-                chunk = r["chunk"]
-                meta = chunk["metadata"]
-                sim = r["similarity_pct"]
-                kw = r.get("keyword_overlap", {})
-
-                if sim >= 70:
-                    bar_color = "linear-gradient(90deg, #10b981, #34d399)"
-                    score_color = "#34d399"
-                elif sim >= 50:
-                    bar_color = "linear-gradient(90deg, #f59e0b, #fbbf24)"
-                    score_color = "#fbbf24"
-                else:
-                    bar_color = "linear-gradient(90deg, #ef4444, #f87171)"
-                    score_color = "#f87171"
-
-                st.markdown(f"""
-                <div class="glass-card">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:.6rem;">
-                        <div>
-                            <span class="source-chip">Rank #{r['rank']}</span>
-                            <span class="source-chip">📄 Page {meta['page_number']}</span>
-                            <span class="source-chip">📂 {meta['section']}</span>
-                        </div>
-                        <div style="font-size:.95rem; font-weight:700; color:{score_color} !important;">
-                            {sim:.1f}%
-                        </div>
+            st.markdown(f"""
+            <div class="glass-card" style="border-left: 4px solid {role_c};">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:.6rem;">
+                    <div>
+                        {role_badge(section)}
+                        <span class="source-chip">Rank #{r['rank']}</span>
+                        <span class="source-chip">📄 Page {meta['page_number']}</span>
                     </div>
-                    <div class="sim-bar-bg">
-                        <div class="sim-bar-fill" style="width:{min(sim,100):.1f}%; background:{bar_color};"></div>
+                    <div style="font-size:.95rem; font-weight:700; color:{score_color} !important;">
+                        {sim:.1f}%
                     </div>
                 </div>
+                <div class="sim-bar-bg">
+                    <div class="sim-bar-fill" style="width:{min(sim,100):.1f}%; background:{bar_color};"></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Statutes
+            if meta.get("statutes_mentioned"):
+                statute_html = "".join(
+                    [f'<span class="source-chip">{s}</span>' for s in meta["statutes_mentioned"]]
+                )
+                st.markdown(f"**Statutes:** {statute_html}", unsafe_allow_html=True)
+
+            # Keyword overlap
+            if matched_kws:
+                kw_html = "".join(
+                    [f'<span class="kw-pill">{k}</span>' for k in matched_kws]
+                )
+                st.markdown(
+                    f"**Keyword Matches** ({kw.get('overlap_count', 0)}/{len(kw.get('query_keywords', []))}): {kw_html}",
+                    unsafe_allow_html=True,
+                )
+
+            # Chunk text
+            with st.expander(f"📝 Full chunk text (Rank #{r['rank']})", expanded=True):
+                highlighted = highlight_keywords(chunk["text"], matched_kws)
+                st.markdown(f'<div style="font-size:.86rem;line-height:1.75;color:#cbd5e1;'
+                            f'background:rgba(255,255,255,.03);border-radius:8px;padding:.9rem 1.1rem;">'
+                            f'{highlighted}</div>', unsafe_allow_html=True)
+                if matched_kws:
+                    st.caption(f"💡 {len(matched_kws)} keyword(s) highlighted in purple — evidence for your query")
+
+            # -- CLICK TO JUMP BUTTON --
+            if st.button(f"📖 View in Context", key=f"jump_{r['rank']}"):
+                st.session_state.active_para = {"page": meta["page_number"], "section": meta["section"]}
+                st.toast(f"Jumping to Page {meta['page_number']}...")
+                time.sleep(0.5)
+                st.rerun()
+
+            st.markdown("")
+
+    # -- 3. Full Document View (JUMP TARGET) --
+    with st.expander("📖 Full Document Viewer", expanded=st.session_state.active_para is not None):
+        st.markdown('<div class="xai-header">📄 Document Context</div>', unsafe_allow_html=True)
+        
+        active = st.session_state.active_para
+        if active:
+            st.info(f"📍 Highlighting Page {active['page']} ({active['section']})")
+            if st.button("Clear Highlight"):
+                st.session_state.active_para = None
+                st.rerun()
+
+        # Iterate through all chunks in the index to show full doc
+        if pipeline.vector_store:
+            all_chunks = pipeline.vector_store.get_all_chunks()
+            for i, meta_chunk in enumerate(all_chunks):
+                is_active = (active and meta_chunk.get("page_number") == active["page"] and meta_chunk.get("section", "").upper() == active["section"].upper())
+                div_class = "highlight-para" if is_active else ""
+                sec = meta_chunk.get("section", "UNKNOWN")
+                
+                st.markdown(f"""
+                <div class="{div_class}" id="para-{i+1}">
+                    <div style="margin-bottom:5px;">{role_badge(sec)} <small style="color:#64748b;">[Page {meta_chunk.get('page_number', '?')}]</small></div>
+                    {meta_chunk['text']}
+                </div>
+                <hr style="margin: 0.5rem 0; opacity: 0.1;">
                 """, unsafe_allow_html=True)
-
-                # Statutes
-                if meta.get("statutes_mentioned"):
-                    statute_html = "".join(
-                        [f'<span class="source-chip">{s}</span>' for s in meta["statutes_mentioned"]]
-                    )
-                    st.markdown(f"**Statutes:** {statute_html}", unsafe_allow_html=True)
-
-                # Keyword overlap
-                if kw.get("matching_keywords"):
-                    kw_html = "".join(
-                        [f'<span class="kw-pill">{k}</span>' for k in kw["matching_keywords"]]
-                    )
-                    st.markdown(
-                        f"**Keyword Matches** ({kw.get('overlap_count', 0)}/{len(kw.get('query_keywords', []))}): {kw_html}",
-                        unsafe_allow_html=True,
-                    )
-
-                # Chunk text
-                with st.expander(f"📝 Full chunk text (Rank #{r['rank']})", expanded=False):
-                    st.markdown(chunk["text"])
-
-                st.markdown("")
 
         # -- 3. Statutes Referenced --
         statute_data = result["xai"].get("statute_analysis", [])

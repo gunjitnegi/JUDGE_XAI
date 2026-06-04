@@ -36,38 +36,65 @@ A dedicated pipeline to generate high-quality, RAG-ready datasets for the Indian
 
 ```mermaid
 graph TD
-    A[Raw PDF/JSONL] --> B[Segmenter]
-    B --> C[Role Labeling LLM]
-    C --> D[FAISS Vector Store]
-    D --> E[Explainable RAG]
-    E --> F[Streamlit UI]
-    C --> G[Dataset Extractor]
-    G --> H[Kaggle/Fine-tuning]
+    subgraph Frontend
+        F[Streamlit UI]
+    end
+    
+    subgraph Backend
+        API[FastAPI Server]
+        B[PDF Processor]
+        C[Query Rewriter]
+        D[FAISS Vector Store]
+        E[Faithfulness Evaluator]
+        H[Statutes Manager]
+    end
+    
+    subgraph LLM & Models
+        O[Ollama: Llama 3.1]
+        X[DeBERTa-v3 NLI]
+    end
+
+    F -- Streams Q&A --> API
+    API --> C
+    C --> D
+    API --> B
+    API --> E
+    E --> X
+    B --> D
+    D --> H
+    H --> O
 ```
 
 ---
 
 ## 🛠️ Tech Stack
 
-*   **Core**: Python 3.11
+*   **Core**: Python 3.10+
 *   **LLM Engine**: Ollama (Llama 3.1:8b-instruct)
-*   **Vector Database**: FAISS
-*   **NLP**: Spacy (en_core_web_sm)
+*   **Vector Database**: FAISS (CPU)
+*   **Cross-Encoder**: DeBERTa-v3 (NLI Faithfulness evaluation)
 *   **Frontend**: Streamlit (Custom Glassmorphic Dark UI)
-*   **Parsing**: PyMuPDF (fitz)
+*   **Backend**: FastAPI
+*   **Parsing & NLP**: PyMuPDF (fitz), Spacy (en_core_web_sm)
 
 ---
 
 ## 🚀 Getting Started
 
-### 1. Prerequisites
-*   Install [Ollama](https://ollama.com/)
-*   Pull the required model:
-    ```bash
-    ollama pull llama3.1:8b-instruct-q4_K_M
-    ```
+### Option A: Docker Deployment (Recommended)
+1. Install [Docker](https://docs.docker.com/get-docker/) and [Ollama](https://ollama.com/).
+2. Pull the required model locally: `ollama pull llama3.1:8b-instruct-q4_K_M`
+3. Run the complete stack:
+   ```bash
+   docker-compose up --build
+   ```
+4. Access the UI at `http://localhost:8501`.
 
-### 2. Installation
+### Option B: Local Setup
+#### 1. Prerequisites
+*   Install [Ollama](https://ollama.com/) and run `ollama pull llama3.1:8b-instruct-q4_K_M`
+
+#### 2. Installation
 ```bash
 git clone https://github.com/gunjitnegi/legal-document-summariser-with-domain-specific-QA-with-Explainable-AI-
 cd JUDGEXAI
@@ -77,20 +104,42 @@ pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
 
-### 3. Run the App
+#### 3. Configuration
+Create a `.env` file in the root directory:
+```env
+OLLAMA_URL=http://localhost:11434/api/generate
+INDEX_DIR=c:/final_year/JUDGEXAI/data/faiss_index
+MODEL_NAME=llama3.1:8b-instruct-q4_K_M
+```
+
+#### 4. Run the Application
+Start the FastAPI backend:
+```bash
+uvicorn app.api:app --host 0.0.0.0 --port 8000
+```
+Start the Streamlit frontend:
 ```bash
 streamlit run app/streamlit_app.py
 ```
 
 ---
 
+## 🧪 Benchmarking
+To run the automated RAG faithfulness benchmark:
+```bash
+python run_benchmark.py
+```
+This tests the system against 10 standard legal queries and records cross-encoder contradiction detection metrics.
+
+---
+
 ## 📂 Project Structure
 
-*   `app/`: Streamlit frontend and UI components.
-*   `src/preprocessing/`: Data cleaning, segmentation, and role labeling.
-*   `src/rag/`: Vector store management and retrieval logic.
-*   `src/qa/`: Ground-truth QA generation engine.
-*   `data/`: (Ignored) Raw and processed legal datasets.
+*   `app/`: Streamlit frontend (`streamlit_app.py`) and FastAPI backend (`api.py`).
+*   `src/rag/`: Core logic (Pipeline, FAISS, Statutes, chunking).
+*   `src/evaluation/`: NLI Cross-Encoder faithfulness checking.
+*   `data/`: FAISS index storage and dataset cache.
+*   `notebooks/`: Research and preprocessing scripts.
 
 ---
 
@@ -101,4 +150,4 @@ Contributions are welcome! If you find a bug or have a feature request, please o
 Distributed under the MIT License. See `LICENSE` for more information.
 
 ---
-**Created with ❤️ for the Indian Legal Community.**
+

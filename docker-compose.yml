@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  judgexai:
+    build: .
+    container_name: judgexai-app
+    ports:
+      - "8501:8501"  # Streamlit
+      - "8000:8000"  # FastAPI
+    environment:
+      - OLLAMA_URL=http://host.docker.internal:11434/api/generate
+      - INDEX_DIR=/app/data/faiss_index
+    volumes:
+      - ./data:/app/data
+      - ./test_pdf:/app/test_pdf
+    restart: unless-stopped
+    # Depending on network config, this enables reaching local Ollama
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

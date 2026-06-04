@@ -1,200 +1,162 @@
-"""
-FAISS Vector Store for JUDGE X AI RAG Pipeline.
-Stores embeddings alongside chunk metadata for retrieval with full XAI traceability.
-"""
-
 import os
-import json
+import chromadb
+from chromadb.config import Settings
 import numpy as np
-import faiss
-from typing import List, Dict, Any, Optional, Tuple
-
+from typing import List, Dict, Any, Optional
 
 class VectorStore:
     """
-    FAISS-backed vector store that maps embeddings to rich chunk metadata.
-    
-    Supports:
-    - Adding chunks with their embeddings and metadata
-    - Similarity search returning ranked results with scores
-    - Saving/loading the index + metadata to/from disk
+    ChromaDB-backed vector store for JUDGE X AI RAG Pipeline.
+    Supports rich metadata filtering and persistent storage.
     """
 
-    def __init__(self, dimension: int, index_type: str = "flat"):
+    def __init__(self, dimension: int, index_type: str = "cosine", persist_dir: str = ".chroma"):
         """
-        Initialize the vector store.
+        Initialize the vector store using ChromaDB.
         
         Args:
-            dimension: Embedding vector dimension (e.g., 768 for nomic-embed-text).
-            index_type: Type of FAISS index. 'flat' for exact search (best for < 100k vectors).
+            dimension: Embedding vector dimension (e.g., 768).
+            index_type: Distance metric (cosine by default).
+            persist_dir: Directory to save the ChromaDB database.
         """
         self.dimension = dimension
         self.index_type = index_type
+        self.persist_dir = persist_dir
+        
+        os.makedirs(self.persist_dir, exist_ok=True)
+        self.client = chromadb.PersistentClient(path=self.persist_dir)
+        
+        space = "cosine" if index_type == "cosine" else "l2"
+        self.collection = self.client.get_or_create_collection(
+            name="judgments",
+            metadata={"hnsw:space": space}
+        )
 
-        if index_type == "flat":
-            # L2 (Euclidean) distance — smaller = more similar
-            self.index = faiss.IndexFlatL2(dimension)
-        elif index_type == "cosine":
-            # Normalize + inner product = cosine similarity
-            self.index = faiss.IndexFlatIP(dimension)
-            self._normalize = True
-        else:
-            raise ValueError(f"Unsupported index type: {index_type}. Use 'flat' or 'cosine'.")
-
-        self._normalize = index_type == "cosine"
-        self.metadata_store: List[Dict[str, Any]] = []  # Parallel list of chunk metadata
-        self.source_file: Optional[str] = None  # Source PDF filename
+    def clear(self) -> None:
+        """Clear all documents from the vector store."""
+        try:
+            self.client.delete_collection("judgments")
+            space = "cosine" if self.index_type == "cosine" else "l2"
+            self.collection = self.client.get_or_create_collection(
+                name="judgments",
+                metadata={"hnsw:space": space}
+            )
+        except Exception as e:
+            print(f"Failed to clear collection: {e}")
 
     def add(self, embeddings: np.ndarray, chunks: List[Dict[str, Any]]) -> None:
         """
-        Add embeddings and their corresponding chunk metadata to the store.
-        
-        Args:
-            embeddings: numpy array of shape (n, dimension).
-            chunks: List of chunk dicts (from LegalPDFProcessor). Must have same length as embeddings.
+        Add embeddings and their corresponding chunk metadata to ChromaDB.
         """
         if len(embeddings) != len(chunks):
             raise ValueError(f"Mismatch: {len(embeddings)} embeddings vs {len(chunks)} chunks")
 
-        if embeddings.shape[1] != self.dimension:
-            raise ValueError(f"Embedding dim {embeddings.shape[1]} != expected {self.dimension}")
-
-        if self._normalize:
-            faiss.normalize_L2(embeddings)
-
-        self.index.add(embeddings)
-        self.metadata_store.extend(chunks)
-        print(f"Added {len(chunks)} vectors. Total vectors in index: {self.index.ntotal}")
-
-    def search(self, query_embedding: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Search the index for the most similar chunks to the query embedding.
+        # Chroma expects lists of lists/floats for embeddings
+        embeddings_list = embeddings.tolist()
         
-        Args:
-            query_embedding: 1D numpy array of shape (dimension,).
-            top_k: Number of top results to return.
+        documents = []
+        metadatas = []
+        ids = []
+        
+        for i, chunk in enumerate(chunks):
+            chunk_id = str(chunk.get("chunk_id", f"auto_id_{i}"))
+            case_id = str(chunk.get("metadata", {}).get("case_id", "unknown_case"))
+            role = str(chunk.get("metadata", {}).get("role", "other"))
+            text = chunk.get("text", "")
             
-        Returns:
-            List of result dicts, each containing:
-              - 'chunk': the original chunk dict (text + metadata)
-              - 'score': similarity score (lower L2 distance = more similar for 'flat',
-                         higher IP = more similar for 'cosine')
-              - 'rank': 1-indexed rank
+            # Store full chunk JSON string in metadata to preserve original structure
+            import json
+            safe_meta = {
+                "case_id": case_id,
+                "role": role,
+                "chunk_json": json.dumps(chunk)
+            }
+            
+            documents.append(text)
+            metadatas.append(safe_meta)
+            ids.append(f"{case_id}_{chunk_id}_{i}")
+
+        self.collection.add(
+            embeddings=embeddings_list,
+            documents=documents,
+            metadatas=metadatas,
+            ids=ids
+        )
+        print(f"Added {len(chunks)} vectors to ChromaDB collection 'judgments'.")
+
+    def search(self, query_embedding: np.ndarray, top_k: int = 5, where: Optional[Dict] = None) -> List[Dict[str, Any]]:
         """
-        if self.index.ntotal == 0:
-            print("Warning: Index is empty. No results to return.")
-            return []
-
-        # Reshape to (1, dimension) for FAISS
-        query = query_embedding.reshape(1, -1).astype(np.float32)
-
-        if self._normalize:
-            faiss.normalize_L2(query)
-
-        distances, indices = self.index.search(query, min(top_k, self.index.ntotal))
-
-        results = []
-        for rank, (idx, dist) in enumerate(zip(indices[0], distances[0]), start=1):
-            if idx == -1:
-                continue  # FAISS returns -1 for unfilled slots
-
-            # Convert L2 distance to a similarity percentage (0-100) for XAI transparency
-            if self.index_type == "flat":
-                # L2 distance: 0 = identical. Convert to similarity score.
-                similarity_pct = round(max(0, 100 * (1 / (1 + dist))), 2)
+        Search the collection using the query embedding, with optional metadata filtering.
+        """
+        query_list = query_embedding.tolist()
+        
+        results = self.collection.query(
+            query_embeddings=[query_list],
+            n_results=top_k,
+            where=where
+        )
+        
+        out_results = []
+        if not results['ids'] or not results['ids'][0]:
+            return out_results
+            
+        import json
+        for rank, (doc_id, dist, meta) in enumerate(zip(results['ids'][0], results['distances'][0], results['metadatas'][0]), start=1):
+            
+            # Distance conversion based on metric
+            if self.index_type == "cosine":
+                # Chroma cosine distance is 1.0 - cosine_similarity. So sim = 1.0 - dist
+                sim = max(0.0, 1.0 - dist)
+                similarity_pct = round(sim * 100, 2)
             else:
-                # Inner product after normalization = cosine similarity (-1 to 1)
-                similarity_pct = round(float(dist) * 100, 2)
+                similarity_pct = round(max(0, 100 * (1 / (1 + dist))), 2)
 
-            results.append({
+            original_chunk = json.loads(meta['chunk_json'])
+            
+            out_results.append({
                 "rank": rank,
                 "score": float(dist),
                 "similarity_pct": similarity_pct,
-                "chunk": self.metadata_store[idx]
+                "chunk": original_chunk
             })
 
-        return results
+        return out_results
+
+    def get_all_chunks(self, case_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve all original chunk dictionaries stored in the collection."""
+        where = {"case_id": case_id} if case_id else None
+        results = self.collection.get(where=where)
+        import json
+        out_chunks = []
+        if results and results.get('metadatas'):
+            for meta in results['metadatas']:
+                if 'chunk_json' in meta:
+                    out_chunks.append(json.loads(meta['chunk_json']))
+        return out_chunks
+
+    def get_all_cases(self) -> List[str]:
+        """Retrieve a list of unique case IDs stored in the collection."""
+        results = self.collection.get()
+        cases = set()
+        if results and results.get('metadatas'):
+            for meta in results['metadatas']:
+                if 'case_id' in meta:
+                    cases.add(meta['case_id'])
+        return sorted(list(cases))
 
     def save(self, directory: str, name: str = "legal_index") -> None:
         """
-        Save the FAISS index and metadata to disk.
-        
-        Args:
-            directory: Directory to save files in.
-            name: Base name for the saved files.
+        ChromaDB is automatically persisted to self.persist_dir.
+        This method is kept for backwards compatibility.
         """
-        os.makedirs(directory, exist_ok=True)
-
-        index_path = os.path.join(directory, f"{name}.faiss")
-        meta_path = os.path.join(directory, f"{name}_metadata.json")
-
-        faiss.write_index(self.index, index_path)
-        with open(meta_path, 'w', encoding='utf-8') as f:
-            json.dump({
-                "dimension": self.dimension,
-                "index_type": self.index_type,
-                "total_vectors": self.index.ntotal,
-                "source_file": self.source_file,
-                "chunks": self.metadata_store
-            }, f, indent=2)
-
-        print(f"Saved index ({self.index.ntotal} vectors) to {index_path}")
-        print(f"Saved metadata to {meta_path}")
+        print(f"ChromaDB automatically persists data to {self.persist_dir}.")
 
     @classmethod
     def load(cls, directory: str, name: str = "legal_index") -> "VectorStore":
         """
-        Load a previously saved FAISS index and metadata from disk.
-        
-        Args:
-            directory: Directory containing the saved files.
-            name: Base name used when saving.
-            
-        Returns:
-            A VectorStore instance with the loaded index and metadata.
+        Loads the VectorStore pointing to the persistent ChromaDB directory.
         """
-        index_path = os.path.join(directory, f"{name}.faiss")
-        meta_path = os.path.join(directory, f"{name}_metadata.json")
-
-        if not os.path.exists(index_path) or not os.path.exists(meta_path):
-            raise FileNotFoundError(f"Index or metadata not found in {directory}")
-
-        with open(meta_path, 'r', encoding='utf-8') as f:
-            meta = json.load(f)
-
-        store = cls(dimension=meta["dimension"], index_type=meta["index_type"])
-        store.index = faiss.read_index(index_path)
-        store.metadata_store = meta["chunks"]
-        store.source_file = meta.get("source_file")
-
-        print(f"Loaded index with {store.index.ntotal} vectors from {index_path}")
+        # We assume the user wants to load from .chroma or the specified directory
+        store = cls(dimension=768, persist_dir=directory)
+        print(f"Loaded ChromaDB collection with {store.collection.count()} vectors.")
         return store
-
-
-if __name__ == "__main__":
-    # Quick integration test with dummy data
-    dim = 768
-    store = VectorStore(dimension=dim)
-
-    # Create fake embeddings and chunks
-    fake_embeddings = np.random.rand(5, dim).astype(np.float32)
-    fake_chunks = [
-        {"chunk_id": i + 1, "text": f"Sample legal text {i + 1}", "metadata": {"page_number": i + 1, "section": "FACTS"}}
-        for i in range(5)
-    ]
-
-    store.add(fake_embeddings, fake_chunks)
-
-    # Search with a random query
-    query = np.random.rand(dim).astype(np.float32)
-    results = store.search(query, top_k=3)
-
-    print("\nSearch Results:")
-    for r in results:
-        print(f"  Rank {r['rank']}: chunk_id={r['chunk']['chunk_id']}, "
-              f"similarity={r['similarity_pct']}%, score={r['score']:.4f}")
-
-    # Test save/load
-    store.save("c:/final_year/JUDGEXAI/data", name="test_index")
-    loaded = VectorStore.load("c:/final_year/JUDGEXAI/data", name="test_index")
-    print(f"\nReloaded index has {loaded.index.ntotal} vectors")

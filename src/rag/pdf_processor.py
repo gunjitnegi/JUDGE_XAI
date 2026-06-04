@@ -5,11 +5,14 @@ import requests
 import spacy
 import fitz  # PyMuPDF
 from typing import List, Dict, Any
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class LegalPDFProcessor:
-    def __init__(self, ollama_url: str = "http://localhost:11434/api/generate", model: str = "llama3.1:8b-instruct-q4_K_M"):
-        self.ollama_url = ollama_url
-        self.model = model
+    def __init__(self, ollama_url: str = None, model: str = None):
+        self.ollama_url = ollama_url or os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+        self.model = model or os.getenv("MODEL_NAME", "llama3.1:8b-instruct-q4_K_M")
         
         # Load spacy for sentence segmentation
         try:
@@ -33,13 +36,38 @@ class LegalPDFProcessor:
         return text.strip()
 
     def _extract_blocks(self, pdf_path: str) -> List[Dict[str, Any]]:
-        """Extract valid text blocks from PDF while ignoring headers/footers."""
+        """Extract valid text blocks from PDF while ignoring headers/footers. Includes OCR fallback."""
         doc = fitz.open(pdf_path)
         valid_blocks = []
         
         for page_num in range(len(doc)):
             page = doc[page_num]
             blocks = page.get_text("blocks")
+            page_text = page.get_text("text").strip()
+            
+            # --- Fix D: Missing OCR Fallback ---
+            if len(page_text) < 50:
+                print(f"Warning: Page {page_num + 1} appears to be scanned or empty. Attempting OCR fallback...")
+                try:
+                    from pdf2image import convert_from_path
+                    import pytesseract
+                    
+                    # Convert the specific page to an image (page_num is 0-indexed, pdf2image uses 1-indexed for some args but we can extract specific page)
+                    # Note: convert_from_path takes first_page and last_page (1-indexed)
+                    images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1)
+                    if images:
+                        ocr_text = pytesseract.image_to_string(images[0]).strip()
+                        if ocr_text:
+                            # Create a fake block spanning the page
+                            valid_blocks.append({
+                                "text": self._clean_text(ocr_text),
+                                "page_number": page_num + 1
+                            })
+                            continue
+                except ImportError:
+                    print("Error: pdf2image or pytesseract not installed. Please run `pip install pytesseract pdf2image`. Skipping OCR.")
+                except Exception as e:
+                    print(f"Error during OCR on page {page_num + 1}: {e}. Ensure Tesseract-OCR is installed on Windows.")
             
             for b in blocks:
                 # b is a tuple: (x0, y0, x1, y1, text, block_no, block_type)
@@ -70,72 +98,99 @@ class LegalPDFProcessor:
         doc.close()
         return valid_blocks
 
-    def _chunk_blocks(self, blocks: List[Dict[str, Any]], max_words: int = 500) -> List[Dict[str, Any]]:
-        """Group blocks into chunks using spacy sentences, never splitting mid-sentence."""
-        chunks = []
-        current_chunk_text = ""
-        current_chunk_pages = set()
-        current_word_count = 0
+    def _chunk_blocks(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge blocks that don't end in sentence boundaries, apply length thresholds."""
+        merged_blocks = []
+        current_text = ""
+        current_page = 1
         
         for block in blocks:
-            doc = self.nlp(block["text"])
-            
-            for sent in doc.sents:
-                sent_text = sent.text.strip()
-                if not sent_text:
-                    continue
-                    
-                sent_words = len(sent_text.split())
-                
-                if current_word_count + sent_words > max_words and current_word_count > 0:
-                    # Save current chunk
-                    chunks.append({
-                        "text": current_chunk_text.strip(),
-                        "page_number": min(current_chunk_pages) if current_chunk_pages else block["page_number"]
-                    })
-                    # Start new chunk
-                    current_chunk_text = sent_text + " "
-                    current_chunk_pages = {block["page_number"]}
-                    current_word_count = sent_words
+            text = block["text"]
+            if not current_text:
+                current_text = text
+                current_page = block["page_number"]
+            else:
+                # If current_text does not end with sentence boundary, merge with next
+                if not re.search(r'[.?!।"”]\s*$', current_text):
+                    current_text += " " + text
                 else:
-                    current_chunk_text += sent_text + " "
-                    current_chunk_pages.add(block["page_number"])
-                    current_word_count += sent_words
-                    
-        # Add the last chunk
-        if current_chunk_text.strip():
-             chunks.append({
-                "text": current_chunk_text.strip(),
-                "page_number": min(current_chunk_pages) if current_chunk_pages else 1
+                    merged_blocks.append({
+                        "text": current_text,
+                        "page_number": current_page
+                    })
+                    current_text = text
+                    current_page = block["page_number"]
+        if current_text:
+            merged_blocks.append({
+                "text": current_text,
+                "page_number": current_page
             })
-             
+            
+        chunks = []
+        for block in merged_blocks:
+            text = block["text"].strip()
+            page = block["page_number"]
+            
+            # Min length threshold
+            if len(text) < 40:
+                continue
+                
+            # Max length threshold
+            if len(text) > 1200:
+                sub_chunks = self._split_large_text(text, max_chars=1200)
+                for sc in sub_chunks:
+                    if len(sc) >= 40:
+                        chunks.append({"text": sc, "page_number": page})
+            else:
+                chunks.append({"text": text, "page_number": page})
+                
         return chunks
 
-    def _classify_section_llm(self, text: str) -> str:
-        """Use lightweight local LLM call to classify the section."""
-        prompt = f"""You are a legal expert AI. Classify the following extract from an Indian legal judgment into ONE of these categories:
-FACTS, ISSUES, ARGUMENTS, REASONING, JUDGMENT, UNKNOWN.
-
-Reply with ONLY the single category word. Do not explain.
-
-Extract:
-{text[:1500]}
-"""
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0.0, "num_predict": 10}
-        }
+    def _split_large_text(self, text: str, max_chars: int) -> List[str]:
+        """Split text exceeding max_chars at nearest sentence boundary (. followed by [A-Z])."""
+        if len(text) <= max_chars:
+            return [text]
+            
+        boundary_pattern = re.compile(r'\.\s+(?=[A-Z])')
+        sub_chunks = []
         
+        while len(text) > max_chars:
+            matches = list(boundary_pattern.finditer(text[:max_chars]))
+            if matches:
+                # Split at last match within limit
+                last_match = matches[-1]
+                split_point = last_match.start() + 1
+                sub_chunks.append(text[:split_point].strip())
+                text = text[split_point:].strip()
+            else:
+                # No boundary found inside limit, find first one outside
+                match = boundary_pattern.search(text)
+                if match:
+                    split_point = match.start() + 1
+                    sub_chunks.append(text[:split_point].strip())
+                    text = text[split_point:].strip()
+                else:
+                    break
+                    
+        if text:
+            sub_chunks.append(text.strip())
+            
+        return sub_chunks
+
+    def _classify_section_llm(self, text: str) -> str:
+        """Use lightweight zero-shot classifier to classify the section."""
         try:
-            response = requests.post(self.ollama_url, json=payload, timeout=10)
-            if response.status_code == 200:
-                result = response.json().get("response", "").strip().upper()
-                # Clean up response just in case the model is wordy
-                for category in ["FACTS", "ISSUES", "ARGUMENTS", "REASONING", "JUDGMENT"]:
-                    if category in result:
-                        return category
+            # We import here to prevent circular imports and keep startup fast
+            from src.preprocessing.role_labelling import classify_single
+            
+            # classify_single returns (role, source, confidence)
+            role, source, conf = classify_single(text, position="middle")
+            
+            if role:
+                role_upper = role.upper()
+                if role_upper == "FINAL_DECISION":
+                    return "JUDGMENT"
+                return role_upper
             return "UNKNOWN"
         except Exception as e:
             print(f"LLM Classification failed: {e}")
@@ -143,11 +198,12 @@ Extract:
 
     def process_pdf(self, pdf_path: str) -> List[Dict[str, Any]]:
         """Main pipeline to process a PDF into enriched chunks."""
+        case_id = os.path.basename(pdf_path)
         print(f"Extracting blocks from {pdf_path}...")
         blocks = self._extract_blocks(pdf_path)
         
-        print("Chunking text using Spacy...")
-        chunks = self._chunk_blocks(blocks, max_words=400)
+        print("Chunking text (merging incomplete sentences)...")
+        chunks = self._chunk_blocks(blocks)
         
         enriched_chunks = []
         
@@ -163,6 +219,7 @@ Extract:
                 "chunk_id": i + 1,
                 "text": chunk["text"],
                 "metadata": {
+                    "case_id": case_id,
                     "page_number": chunk["page_number"],
                     "section": section,
                     "statutes_mentioned": statutes,
